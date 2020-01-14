@@ -13,15 +13,19 @@ use Illuminate\Support\Facades\View;
 
 class ProductsSearchService
 {
+    public $term = '';
+    public $words = [];
+    public $terms = [];
+
+    private $exclude        = ['для', 'или'];
+    private $wordsLimit     = 6;
+    private $wordMinLength  = 3;
+
     private $agent;
     private $search;
     private $product;
     private $agent_group;
     private $manufacturer;
-
-    private $exclude        = ['для'];
-    private $maxWords       = 12;
-    private $wordMinLength  = 3;
 
     public function __construct(
         AgentRepository $agent,
@@ -38,72 +42,46 @@ class ProductsSearchService
         $this->manufacturer = $manufacturer;
     }
 
-    public function get($term)
-    {
-        $products = DB::table('products_search')
-            ->where('title', 'like', '%' . mb_strtolower($term) . '%')
-            ->orderBy('title')
-            ->get();
-
-        $products = $products->sortBy(function($item) use ($term) {
-            return mb_strpos(mb_strtolower($item->title), $term);
-        });
-
-        $products = $products->values()->slice(0, 8);
-
-        return $products;
-    }
-
     public function search($term)
     {
-        $term = mb_strtolower($term);
+        $this->setSearchWords($term);
 
-        $terms[$term] = 1;
+        $result = $this->searchProducts();
+        if ($result)
+            return $result;
 
-        $pattern = '/[\'\"\*\)\(«»]+/u';
-        $termUpdated = preg_replace($pattern, '', $term);
+        $result = $this->searchManufacturer();
+        if ($result)
+            return $result;
 
-        $pattern = '/[\-_]+/u';
-        $termUpdated = preg_replace($pattern, ' ', $termUpdated);
+        // todo добавить категории?
 
-        $words = explode(' ', $termUpdated);
-        $words[] = $termUpdated;
+        $result = $this->searchAgent();
+        if ($result)
+            return $result;
 
-        $counter = 0;
-        foreach($words as $key => $word)
-        {
-            if ($counter == $this->maxWords)
-                break;
+        $result = $this->searchAgentGroup();
+        if ($result)
+            return $result;
 
-            $word = trim($word);
+        return false;
+    }
 
-            if (mb_strlen($word) < $this->wordMinLength) // исключаем слова длиной меньше 2 символов
-                unset($words[$key]);
-            else {
-                if (!in_array($word, $this->exclude)) {
-                    $words[$key] = $word;
-                    $counter++;
-                }
-            }
-        }
-
+    public function searchProducts()
+    {
         $ids = [];
-        foreach($words as $word)
+        foreach($this->words as $word) // ищем прямые соответствия
         {
             $r = Redis::get($word);
-            $terms[$word] = 1;
-
             if ($r) {
                 $r = json_decode($r, true);
                 foreach($r as $id)
-                    isset($ids[$id])
-                        ? $ids[$id]++
-                        : $ids[$id] = 1;
+                    isset($ids[$id]) ? $ids[$id]++ : $ids[$id] = 1;
             }
         }
 
         if (!$ids) {
-            foreach($words as $word)
+            foreach($this->words as $word) // ищем частичные соответствия в названиях
             {
                 $res = DB::table('products')
                     ->select('id')
@@ -113,18 +91,16 @@ class ProductsSearchService
                     ->get();
 
                 if ($res->count()) {
-                    foreach ($res as $item)
-                        isset($ids[$item->id])
-                            ? $ids[$item->id]++
-                            : $ids[$item->id] = 1;
+                    $res = $res->keyBy('id');
+                    foreach ($res as $id => $item)
+                        isset($ids[$id]) ? $ids[$id]++ : $ids[$id] = 1;
                 }
             }
         }
 
         if (!$ids) {
             $redisTerms = Redis::smembers('terms');
-
-            foreach($words as $word) {
+            foreach($this->words as $word) { // проверяем на ошибки в словах
                 foreach ($redisTerms as $redisTerm) {
 
                     $length = mb_strlen($word);
@@ -136,120 +112,21 @@ class ProductsSearchService
                     if ($maxErrors) {
                         if ($this->levenshtein_utf8($redisTerm, $word) < $maxErrors) {
                             $r = Redis::get($redisTerm);
-                            $terms[$redisTerm] = 1;
-
                             if ($r) {
                                 $r = json_decode($r, true);
-                                foreach ($r as $id) {
-                                    isset($ids[$id])
-                                        ? $ids[$id]++
-                                        : $ids[$id] = 1;
-                                }
+                                foreach ($r as $id)
+                                    isset($ids[$id]) ? $ids[$id]++ : $ids[$id] = 1;
                             }
+
+                            $this->terms[$redisTerm] = 1;
                         }
                     }
                 }
             }
         }
 
-        $terms = array_keys($terms);
-
-        $result = [
-            'ip'        => request()->ip(),
-            'term'      => $term,
-            'terms'     => $terms,
-        ];
-
-        if (!$ids) {
-
-            foreach($words as $word)
-            {
-                $manufacturers = DB::table('manufacturers')
-                    ->select('id')
-                    ->where('status', '>', 0)
-                    ->where(function($q) use ($word) {
-                        $q->orWhere('title', 'LIKE', '%' . $word . '%');
-                        $q->orWhere('title_lat', 'LIKE', '%' . $word . '%');
-                    })
-                    ->get();
-
-                if ($manufacturers->count()) {
-                    $id = $manufacturers->first()->id;
-                    $manufacturer = $this->manufacturer->get($id);
-                    if ($manufacturer->active()->count()) {
-                        $result['entity']       = 'manufacturer';
-                        $result['ids']          = [$id];
-                        $result['target_ids']   = [$id];
-
-                        $this->search->insert($result);
-
-                        return redirect()->route('manufacturer.view', $manufacturer->alias);
-                    } else {
-                        $result['entity']       = 'manufacturer';
-                        $result['ids']          = [$id];
-                        $result['target_ids']   = [];
-
-                        return $this->product->getSome([]);
-                    }
-                }
-            }
-        }
-
-        if (!$ids) {
-            foreach($words as $word)
-            {
-                $agents = DB::table('agents')
-                    ->select('id')
-                    ->where('title', 'LIKE', '%' . $word . '%')
-                    ->get();
-
-                if ($agents->count()) {
-                    $id = $agents->first()->id;
-
-                    $result['entity']       = 'agent';
-                    $result['ids']          = [$id];
-                    $result['target_ids']   = [$id];
-
-                    $this->search->insert($result);
-
-                    return redirect()->route('product.search.agents', [
-                        'query' => 1,
-                        'agents' => implode(',', [$id, 0, 100])
-                    ]);
-                }
-            }
-        }
-
-        if (!$ids) {
-            foreach($words as $word)
-            {
-                $groups = DB::table('agent_groups')
-                    ->select('id')
-                    ->where('title', 'LIKE', '%' . $word . '%')
-                    ->get();
-
-                if ($groups->count()) {
-                    $id = $groups->first()->id;
-
-                    $result['entity']       = 'agent_group';
-                    $result['ids']          = [$id];
-                    $result['target_ids']   = [$id];
-
-                    $this->search->insert($result);
-
-                    $agents = $this->agent->getSomeBy('group_id', $id);
-
-                    $contents = [];
-                    foreach($agents as $agent)
-                        $contents[] = implode(',', [$agent->id, 0, 100]) ;
-
-                    return redirect()->route('product.search.agents', [
-                        'query' => 1,
-                        'agents' => implode('|', $contents)
-                    ]);
-                }
-            }
-        }
+        if (!$ids)
+            return false;
 
         $productIds = array_keys($ids);
 
@@ -257,8 +134,6 @@ class ProductsSearchService
         $products = $products->sortByDesc(function($item) use ($ids) {
             return $ids[$item->id];
         });
-
-        View::share('terms', $terms);
 
         $targetIds = [];
         if (count($ids) > 1) {
@@ -273,13 +148,165 @@ class ProductsSearchService
             $targetIds = $productIds;
         }
 
-        $result['entity']       = 'product';
-        $result['ids']          = $productIds;
-        $result['target_ids']   = $targetIds;
+        $this->terms = array_keys($this->terms);
+
+        View::share('terms', $this->terms);
+
+        $result = [
+            'ip'            => request()->ip(),
+            'terms'         => $this->terms,
+            'entity'        => 'product',
+            'ids'           => $productIds,
+            'target_ids'    => $targetIds,
+            'term'          => $this->term
+        ];
 
         $this->search->insert($result);
 
         return $products;
+    }
+
+    public function searchManufacturer()
+    {
+        foreach($this->words as $word)
+        {
+            $manufacturers = DB::table('manufacturers')
+                ->select('id')
+                ->where('status', '>', 0)
+                ->where(function($q) use ($word) {
+                    $q->orWhere('title', 'LIKE', '%' . $word . '%');
+                    $q->orWhere('title_lat', 'LIKE', '%' . $word . '%');
+                })
+                ->get();
+
+            if ($manufacturers->count()) {
+                $id = $manufacturers->first()->id;
+                $manufacturer = $this->manufacturer->get($id); // Eloquent
+                if ($manufacturer->active()->count()) { // if has active products
+
+                    $result = [
+                        'ip'            => request()->ip(),
+                        'terms'         => array_keys($this->terms),
+                        'entity'        => 'manufacturer',
+                        'ids'           => [$id],
+                        'target_ids'    => [$id],
+                        'term'          => $this->term
+                    ];
+
+                    $this->search->insert($result);
+
+                    return redirect()->route('manufacturer.view', $manufacturer->alias);
+                }
+            }
+        }
+
+        return false;
+    }
+
+    public function searchAgent()
+    {
+        foreach($this->words as $word)
+        {
+            $agents = DB::table('agents')
+                ->select('id')
+                ->where('title', 'LIKE', '%' . $word . '%')
+                ->get();
+
+            if ($agents->count()) {
+                $id = $agents->first()->id;
+
+                $result = [
+                    'ip'            => request()->ip(),
+                    'terms'         => array_keys($this->terms),
+                    'entity'        => 'agent',
+                    'ids'           => [$id],
+                    'target_ids'    => [$id],
+                    'term'          => $this->term
+                ];
+
+                $this->search->insert($result);
+
+                return redirect()->route('product.search.agents', [
+                    'query' => 1,
+                    'agents' => implode(',', [$id, 0, 100])
+                ]);
+            }
+        }
+
+        return false;
+    }
+
+    public function searchAgentGroup()
+    {
+        foreach($this->words as $word)
+        {
+            $groups = DB::table('agent_groups')
+                ->select('id')
+                ->where('title', 'LIKE', '%' . $word . '%')
+                ->get();
+
+            if ($groups->count()) {
+                $id = $groups->first()->id;
+
+                $result = [
+                    'ip'            => request()->ip(),
+                    'terms'         => array_keys($this->terms),
+                    'entity'        => 'agent_group',
+                    'ids'           => [$id],
+                    'target_ids'    => [$id],
+                    'term'          => $this->term
+                ];
+
+                $this->search->insert($result);
+
+                $agents = $this->agent->getSomeBy('group_id', $id);
+
+                $contents = [];
+                foreach($agents as $agent)
+                    $contents[] = implode(',', [$agent->id, 0, 100]) ;
+
+                return redirect()->route('product.search.agents', [
+                    'query' => 1,
+                    'agents' => implode('|', $contents)
+                ]);
+            }
+        }
+
+        return false;
+    }
+
+    private function setSearchWords($term)
+    {
+        $this->term = $term;
+
+        $term = mb_strtolower($term);
+
+        $this->terms[$term] = 1;
+
+        $termUpdated = preg_replace('/[\'\"\*\)\(«»]+/u', '', $term);
+        $termUpdated = preg_replace('/[\-\.\,\;\:_]+/u', ' ', $termUpdated);
+
+        $wordsRaw = explode(' ', $termUpdated);
+        $wordsRaw[] = $termUpdated;
+
+        $counter = 0;
+        foreach($wordsRaw as $key => $word)
+        {
+            if (mb_strlen($word) < $this->wordMinLength) // исключаем слова малой длины
+                continue;
+
+            if (in_array($word, $this->exclude))
+                continue;
+
+            $this->words[$word] = 1;
+            $this->terms[$word] = 1;
+
+            $counter++;
+            if ($counter == $this->wordsLimit)
+                break;
+        }
+
+        $this->words = array_keys($this->words);
     }
 
     private function levenshtein_utf8($s1, $s2)
